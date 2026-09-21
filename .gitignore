@@ -3,3 +3,4 @@ __pycache__/
 /partials/*
 /projects/*
 !/projects/.gitkeep
+!/partials/.gitkeep
