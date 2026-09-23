@@ -23,6 +23,8 @@ class LLM:
     OLLAMA_MODEL = "qwen3:14b"
     OPENROUTER_MODEL = "openrouter/free"
     DESTRUCTIVE_TOOLS = {"write_file", "delete_file"}
+    DEFAULT_MAX_CONTINUATIONS = 3
+    DEFAULT_HISTORY_MAX_CHARS = 24000
     CONFIRM_ANSWERS = {"y", "yes", "a", "ano", "áno"}
 
     # ASCII variants avoid terminal encoding differences in interactive prompts.
@@ -129,6 +131,56 @@ Be direct and concise. Use Markdown and fenced code blocks. Preserve existing fu
             return choices[0].get("message") or {}
         return data.get("message", {}) or {}
 
+    def _finish_reason(self, data):
+        """Return the provider's reason for ending a response, when available."""
+        if self.provider == "openrouter":
+            choices = data.get("choices", [])
+            return str(choices[0].get("finish_reason", "")).lower() if choices else ""
+        return str(data.get("done_reason", "")).lower()
+
+    def _response_was_truncated(self, data):
+        # OpenAI-compatible APIs use ``length``. Ollama normally uses the same
+        # value, but accepting the other common spellings keeps this portable.
+        return self._finish_reason(data) in {"length", "max_tokens", "token_limit"}
+
+    def _max_continuations(self):
+        value = self._read_config().get("max_continuations", self.DEFAULT_MAX_CONTINUATIONS)
+        try:
+            return max(0, min(int(value), 10))
+        except (TypeError, ValueError):
+            return self.DEFAULT_MAX_CONTINUATIONS
+
+    def _recent_history(self, history):
+        """Keep recent complete turns within a bounded input-context budget."""
+        limit = self._read_config().get("history_max_chars", self.DEFAULT_HISTORY_MAX_CHARS)
+        try:
+            limit = max(0, int(limit))
+        except (TypeError, ValueError):
+            limit = self.DEFAULT_HISTORY_MAX_CHARS
+
+        selected, used = [], 0
+        # History is stored as user/assistant pairs. Do not retain half a turn.
+        for index in range(len(history) - 2, -1, -2):
+            turn = history[index:index + 2]
+            turn_size = sum(len(str(text)) for _, text in turn)
+            if selected and used + turn_size > limit:
+                break
+            if not selected and turn_size > limit:
+                # A single fresh turn is still more useful than no context.
+                selected[0:0] = turn
+                break
+            selected[0:0] = turn
+            used += turn_size
+        return selected
+
+    @staticmethod
+    def _continuation_prompt():
+        return (
+            "Your previous answer was cut off by the provider's output-token limit. "
+            "Continue exactly where it ended. Do not repeat completed text; finish "
+            "the original task."
+        )
+
     def _execute_tool(self, name, args):
         if self.tools_handler is None:
             return "No project is currently open."
@@ -188,18 +240,35 @@ Be direct and concise. Use Markdown and fenced code blocks. Preserve existing fu
 
     def agent_chat(self, user_input, max_steps=30):
         messages = [{"role": "system", "content": self.get_system_instructions()}]
-        messages.extend({"role": role, "content": text} for role, text in self.history[-10:])
+        messages.extend({"role": role, "content": text} for role, text in self._recent_history(self.history))
         messages.append({"role": "user", "content": user_input})
         final_text = ""
+        final_parts = []
+        continuations = 0
 
         for _ in range(max_steps):
             try:
-                message = self._assistant_message(self._call_llm(messages, self.tools_handler is not None))
+                data = self._call_llm(messages, self.tools_handler is not None)
+                message = self._assistant_message(data)
             except Exception as error:
                 return self._request_error(error)
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
-                final_text = (message.get("content") or "").strip()
+                part = (message.get("content") or "").strip()
+                if part:
+                    final_parts.append(part)
+                if self._response_was_truncated(data) and continuations < self._max_continuations():
+                    continuations += 1
+                    self.logger.log(
+                        f"Response reached token limit; continuing ({continuations}/{self._max_continuations()}).",
+                        "SYSTEM",
+                    )
+                    messages.append(message)
+                    messages.append({"role": "user", "content": self._continuation_prompt()})
+                    continue
+                final_text = "\n\n".join(final_parts)
+                if self._response_was_truncated(data):
+                    final_text += "\n\n[The response is still incomplete after the automatic continuation limit.]"
                 break
             messages.append(message)
             for call in tool_calls:
@@ -214,7 +283,9 @@ Be direct and concise. Use Markdown and fenced code blocks. Preserve existing fu
                 self.logger.log(f"Tool result: {str(result)[:300]}", "SYSTEM")
                 messages.append(self._tool_result_message(call, result))
         else:
-            final_text = "Reached the maximum number of tool steps without a final answer."
+            final_text = "\n\n".join(final_parts)
+            suffix = "Reached the maximum number of tool steps without a final answer."
+            final_text = f"{final_text}\n\n{suffix}" if final_text else suffix
         if final_text:
             self.history.extend((("user", user_input), ("assistant", final_text)))
         return final_text
@@ -224,12 +295,30 @@ Be direct and concise. Use Markdown and fenced code blocks. Preserve existing fu
 
     def simple_chat(self, user_input):
         messages = [{"role": "system", "content": self.get_simple_chat_instructions()}]
-        messages.extend({"role": role, "content": text} for role, text in self.simple_history[-10:])
+        messages.extend({"role": role, "content": text} for role, text in self._recent_history(self.simple_history))
         messages.append({"role": "user", "content": user_input})
-        try:
-            final_text = (self._assistant_message(self._call_llm(messages, False)).get("content") or "").strip()
-        except Exception as error:
-            return self._request_error(error)
+        final_parts = []
+        for continuation in range(self._max_continuations() + 1):
+            try:
+                data = self._call_llm(messages, False)
+                message = self._assistant_message(data)
+            except Exception as error:
+                return self._request_error(error)
+            part = (message.get("content") or "").strip()
+            if part:
+                final_parts.append(part)
+            if not self._response_was_truncated(data):
+                break
+            if continuation == self._max_continuations():
+                final_parts.append("[The response is still incomplete after the automatic continuation limit.]")
+                break
+            self.logger.log(
+                f"Response reached token limit; continuing ({continuation + 1}/{self._max_continuations()}).",
+                "SYSTEM",
+            )
+            messages.append(message)
+            messages.append({"role": "user", "content": self._continuation_prompt()})
+        final_text = "\n\n".join(final_parts)
         if final_text:
             self.simple_history.extend((("user", user_input), ("assistant", final_text)))
         return final_text
